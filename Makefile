@@ -7,9 +7,7 @@ CMAKE_BUILD_TYPE := "release"
 JOBS             := 6
 
 external:
-	cd external
-	./clone_external.sh
-	./build_external.sh
+	cd external && ./clone_external.sh && ./build_external.sh
 
 build: external
 	mkdir -p $(WORKINGDIR)
