@@ -107,18 +107,10 @@ void initGLSLInput(GLMContext ctx, GLuint type, const char *src, glslang_input_t
      * Must be set AFTER version detection above
      *
      * Note: glslang only exposes GLSLANG_TARGET_OPENGL_450, so we use that
-     * as the SPIR-V target for all modern GLSL versions
+     * as the SPIR-V target for all modern GLSL versions.
+     * Always use OPENGL_450 — it is the only valid OpenGL target enum in glslang.
      */
-    if (glsl_version < 330) {
-        /* Legacy GLSL - still target 450 for SPIR-V but shader will be upgraded */
-        input->client_version = GLSLANG_TARGET_OPENGL_450;
-    } else if (glsl_version == 330) {
-        /* GLSL 3.30 shaders - target OpenGL 3.30 for SPIR-V */
-        input->client_version = 330;  /* Use numeric value directly */
-    } else {
-        /* GLSL 4.00+ - target OpenGL 4.50 for SPIR-V */
-        input->client_version = GLSLANG_TARGET_OPENGL_450;
-    }
+    input->client_version = GLSLANG_TARGET_OPENGL_450;
 
     /* For legacy GLSL versions, replace #version directive in source copy */
     static char *modified_src = NULL;
@@ -187,7 +179,12 @@ void initGLSLInput(GLMContext ctx, GLuint type, const char *src, glslang_input_t
     input->messages = GLSLANG_MSG_DEFAULT_BIT | GLSLANG_MSG_DEBUG_INFO_BIT | GLSLANG_MSG_RELAXED_ERRORS_BIT;
     input->resource = glslang_default_resource();
 
-    input->force_default_version_and_profile = 1;
+    // Do NOT force the version/profile — when set to 1 glslang overrides the
+    // shader's own #version directive and may silently switch to a non-core
+    // profile that rejects layout(binding=X) on UBOs (the "binding" error seen
+    // in the crash log).  Let glslang honour the #version already in the source
+    // (or the default_version above if no #version is present).
+    input->force_default_version_and_profile = 0;
 }
 
 Shader *newShader(GLMContext ctx, GLenum type, GLuint shader)
