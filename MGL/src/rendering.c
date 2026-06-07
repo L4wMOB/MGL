@@ -146,15 +146,22 @@ void mglDrawBuffer(GLMContext ctx, GLenum buf)
     if ((buf >= GL_COLOR_ATTACHMENT0) &&
         (buf <= (GL_COLOR_ATTACHMENT0 + STATE(max_color_attachments))))
     {
-        // ok
+        // ok — handled below
     }
     else
     switch(buf)
     {
+        case GL_NONE:
+            // GL_NONE is valid: it disables colour output for the current draw
+            // framebuffer.  Update state and return without error.
+            STATE(draw_buffer) = GL_NONE;
+            STATE(dirty_bits) |= DIRTY_STATE;
+            return;
+
         case GL_FRONT:
             break;
 
-        case GL_NONE:
+        case GL_BACK:
         case GL_FRONT_LEFT:
         case GL_FRONT_RIGHT:
         case GL_BACK_LEFT:
@@ -164,7 +171,11 @@ void mglDrawBuffer(GLMContext ctx, GLenum buf)
         case GL_FRONT_AND_BACK:
             // TODO: Implement these buffer modes properly
             fprintf(stderr, "MGL: mglDrawBuffer called with unimplemented mode 0x%x\n", buf);
-            break;
+            // Still update state so downstream code (e.g. BlitFramebuffer) is
+            // consistent and can fall back gracefully.
+            STATE(draw_buffer) = buf;
+            STATE(dirty_bits) |= DIRTY_STATE;
+            return;
 
         default:
             fprintf(stderr, "MGL Error: mglDrawBuffer: invalid enum 0x%x\n", buf);
@@ -176,13 +187,24 @@ void mglDrawBuffer(GLMContext ctx, GLenum buf)
     {
         // probably should validate current fbo..
         Framebuffer * fbo = ctx->state.framebuffer;
-        if (!fbo || !fbo->color_attachments[buf-GL_COLOR_ATTACHMENT0].buf.rbo)
-        {
-            fprintf(stderr, "MGL Error: mglDrawBuffer: missing color attachment %u\n", (unsigned)(buf - GL_COLOR_ATTACHMENT0));
-            ERROR_RETURN(GL_INVALID_OPERATION);
-            return;
+        if (!fbo) {
+            // Default framebuffer has no color_attachments array — just update state.
+        } else {
+            FBOAttachment *att = &fbo->color_attachments[buf - GL_COLOR_ATTACHMENT0];
+            // The attachment may be a texture (buf.tex) or an RBO (buf.rbo).
+            // Only flag an error if neither is set.
+            bool has_tex = (att->textarget != GL_RENDERBUFFER) && (att->buf.tex != NULL);
+            bool has_rbo = (att->textarget == GL_RENDERBUFFER) && (att->buf.rbo != NULL);
+            if (!has_tex && !has_rbo) {
+                fprintf(stderr, "MGL Error: mglDrawBuffer: missing color attachment %u\n",
+                        (unsigned)(buf - GL_COLOR_ATTACHMENT0));
+                ERROR_RETURN(GL_INVALID_OPERATION);
+                return;
+            }
+            if (has_rbo) {
+                att->buf.rbo->is_draw_buffer = GL_TRUE;
+            }
         }
-        fbo->color_attachments[buf-GL_COLOR_ATTACHMENT0].buf.rbo->is_draw_buffer = GL_TRUE;
     }
 
     STATE(draw_buffer) = buf;
@@ -513,4 +535,3 @@ void mglReadPixels(GLMContext ctx, GLint x, GLint y, GLsizei width, GLsizei heig
     
     vm_deallocate(mach_host_self(), buffer_data, buffer_size);
 }
-
