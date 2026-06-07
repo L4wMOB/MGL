@@ -2356,100 +2356,146 @@ extern FBOAttachment *getFBOAttachment(GLMContext ctx, Framebuffer *fbo, GLenum 
     //int readtex, drawtex;
 
     readfbo = ctx->state.readbuffer;
-
-    id<MTLTexture> readtexid;
-
-    if (readfbo == NULL) {
-        // Default framebuffer — read from the current drawable
-        if (!_drawable) {
-            fprintf(stderr, "MGL ERROR: mtlBlitFramebuffer: no drawable for default read framebuffer\n");
-            return;
-        }
-        readtexid = _drawable.texture;
-    } else {
-        GLenum read_attach = STATE(read_buffer);
-        // When read_buffer is GL_NONE or a legacy front/back enum, fall back to
-        // COLOR_ATTACHMENT0 so we always have a valid attachment to blit from.
-        if (read_attach == GL_NONE ||
-            read_attach == GL_FRONT ||
-            read_attach == GL_BACK  ||
-            read_attach == GL_FRONT_LEFT  ||
-            read_attach == GL_FRONT_RIGHT ||
-            read_attach == GL_BACK_LEFT   ||
-            read_attach == GL_BACK_RIGHT) {
-            read_attach = GL_COLOR_ATTACHMENT0;
-        }
-        FBOAttachment * fboa = getFBOAttachment(ctx, readfbo, read_attach);
-        assert(fboa);
-        Texture * readtexobj;
-        if (fboa->textarget == GL_RENDERBUFFER)
-        {
-            readtexobj = fboa->buf.rbo->tex;
-        }
-        else
-        {
-            readtexobj = fboa->buf.tex;
-        }
-        assert(readtexobj);
-        readtexid = (__bridge id<MTLTexture>)(readtexobj->mtl_data);
-        assert(readtexid);
-    }
-
-
     drawfbo = ctx->state.framebuffer;
 
-    id<MTLTexture> drawtexid;
-    if (drawfbo == NULL) {
-        // Default framebuffer — write to the current drawable
-        if (!_drawable) {
-            fprintf(stderr, "MGL ERROR: mtlBlitFramebuffer: no drawable for default draw framebuffer\n");
-            return;
+    // Helper block: resolve a Texture* from an FBOAttachment*
+    Texture * (^texFromAttach)(FBOAttachment *) = ^(FBOAttachment *att) {
+        if (!att) return (Texture *)NULL;
+        if (att->textarget == GL_RENDERBUFFER)
+            return att->buf.rbo ? att->buf.rbo->tex : (Texture *)NULL;
+        return att->buf.tex;
+    };
+
+    // Determine which GL attachment enum to use based on the blit mask.
+    // mask bits: GL_COLOR_BUFFER_BIT=0x4000 (not 0x4000 — 0x4000 is GL_DEPTH_BUFFER_BIT on some headers)
+    // OpenGL: GL_COLOR_BUFFER_BIT=0x00004000, GL_DEPTH_BUFFER_BIT=0x00000100, GL_STENCIL_BUFFER_BIT=0x00000400
+    // glslang mask values from log: 0x4000 = GL_COLOR_BUFFER_BIT in GL header (16384)
+    // Double-check: GL_COLOR_BUFFER_BIT=0x4000, GL_DEPTH_BUFFER_BIT=0x0100, GL_STENCIL_BUFFER_BIT=0x0400
+    bool blit_color   = (mask & GL_COLOR_BUFFER_BIT)   != 0;
+    bool blit_depth   = (mask & GL_DEPTH_BUFFER_BIT)   != 0;
+    bool blit_stencil = (mask & GL_STENCIL_BUFFER_BIT) != 0;
+
+    // Build list of (readTex, drawTex) pairs to copy, one per mask bit.
+    id<MTLTexture> readTextures[3];
+    id<MTLTexture> drawTextures[3];
+    int copyCount = 0;
+
+    // ---- COLOR ----
+    if (blit_color) {
+        id<MTLTexture> rtex = nil, dtex = nil;
+
+        if (readfbo == NULL) {
+            if (_drawable) rtex = _drawable.texture;
+        } else {
+            GLenum ra = STATE(read_buffer);
+            if (ra < GL_COLOR_ATTACHMENT0 || ra > GL_COLOR_ATTACHMENT0 + 7)
+                ra = GL_COLOR_ATTACHMENT0;
+            Texture *t = texFromAttach(getFBOAttachment(ctx, readfbo, ra));
+            if (t && t->mtl_data) rtex = (__bridge id<MTLTexture>)(t->mtl_data);
         }
-        drawtexid = _drawable.texture;
-    } else {
-        GLenum draw_attach = STATE(draw_buffer);
-        // When draw_buffer is GL_NONE or a legacy front/back enum, fall back to
-        // COLOR_ATTACHMENT0 to avoid invalid attachment lookup.
-        if (draw_attach == GL_NONE ||
-            draw_attach == GL_FRONT ||
-            draw_attach == GL_BACK  ||
-            draw_attach == GL_FRONT_LEFT  ||
-            draw_attach == GL_FRONT_RIGHT ||
-            draw_attach == GL_BACK_LEFT   ||
-            draw_attach == GL_BACK_RIGHT) {
-            draw_attach = GL_COLOR_ATTACHMENT0;
+
+        if (drawfbo == NULL) {
+            if (_drawable) dtex = _drawable.texture;
+        } else {
+            GLenum da = STATE(draw_buffer);
+            if (da < GL_COLOR_ATTACHMENT0 || da > GL_COLOR_ATTACHMENT0 + 7)
+                da = GL_COLOR_ATTACHMENT0;
+            Texture *t = texFromAttach(getFBOAttachment(ctx, drawfbo, da));
+            if (t && t->mtl_data) dtex = (__bridge id<MTLTexture>)(t->mtl_data);
         }
-        FBOAttachment * fboa = getFBOAttachment(ctx, drawfbo, draw_attach);
-        if (!fboa) {
-            fprintf(stderr, "MGL ERROR: mtlBlitFramebuffer: no draw attachment for enum 0x%x\n", draw_attach);
-            return;
+
+        if (rtex && dtex) {
+            if (rtex.pixelFormat == dtex.pixelFormat) {
+                readTextures[copyCount] = rtex;
+                drawTextures[copyCount] = dtex;
+                copyCount++;
+            } else {
+                fprintf(stderr, "MGL WARN: mtlBlitFramebuffer: color pixel format mismatch src=%lu dst=%lu, skipping\n",
+                        (unsigned long)rtex.pixelFormat, (unsigned long)dtex.pixelFormat);
+            }
+        } else {
+            fprintf(stderr, "MGL WARN: mtlBlitFramebuffer: color blit requested but src=%s dst=%s\n",
+                    rtex ? "ok" : "nil", dtex ? "ok" : "nil");
         }
-        Texture * drawtexobj;
-        if (fboa->textarget == GL_RENDERBUFFER)
-        {
-            drawtexobj = fboa->buf.rbo->tex;
-        }
-        else
-        {
-            drawtexobj = fboa->buf.tex;
-        }
-        if (!drawtexobj || !drawtexobj->mtl_data) {
-            fprintf(stderr, "MGL ERROR: mtlBlitFramebuffer: draw texture not yet allocated\n");
-            return;
-        }
-        drawtexid = (__bridge id<MTLTexture>)(drawtexobj->mtl_data);
     }
 
+    // ---- DEPTH ----
+    if (blit_depth && readfbo && drawfbo) {
+        Texture *rt = texFromAttach(getFBOAttachment(ctx, readfbo, GL_DEPTH_ATTACHMENT));
+        Texture *dt = texFromAttach(getFBOAttachment(ctx, drawfbo, GL_DEPTH_ATTACHMENT));
+        if (rt && rt->mtl_data && dt && dt->mtl_data) {
+            id<MTLTexture> rtex = (__bridge id<MTLTexture>)(rt->mtl_data);
+            id<MTLTexture> dtex = (__bridge id<MTLTexture>)(dt->mtl_data);
+            if (rtex.pixelFormat == dtex.pixelFormat) {
+                readTextures[copyCount] = rtex;
+                drawTextures[copyCount] = dtex;
+                copyCount++;
+            } else {
+                fprintf(stderr, "MGL WARN: mtlBlitFramebuffer: depth pixel format mismatch, skipping\n");
+            }
+        } else {
+            fprintf(stderr, "MGL WARN: mtlBlitFramebuffer: depth blit requested but attachment missing\n");
+        }
+    }
+
+    // ---- STENCIL ----
+    if (blit_stencil && readfbo && drawfbo) {
+        Texture *rt = texFromAttach(getFBOAttachment(ctx, readfbo, GL_STENCIL_ATTACHMENT));
+        Texture *dt = texFromAttach(getFBOAttachment(ctx, drawfbo, GL_STENCIL_ATTACHMENT));
+        if (rt && rt->mtl_data && dt && dt->mtl_data) {
+            id<MTLTexture> rtex = (__bridge id<MTLTexture>)(rt->mtl_data);
+            id<MTLTexture> dtex = (__bridge id<MTLTexture>)(dt->mtl_data);
+            if (rtex.pixelFormat == dtex.pixelFormat) {
+                readTextures[copyCount] = rtex;
+                drawTextures[copyCount] = dtex;
+                copyCount++;
+            } else {
+                fprintf(stderr, "MGL WARN: mtlBlitFramebuffer: stencil pixel format mismatch, skipping\n");
+            }
+        } else {
+            fprintf(stderr, "MGL WARN: mtlBlitFramebuffer: stencil blit requested but attachment missing\n");
+        }
+    }
+
+    if (copyCount == 0) {
+        fprintf(stderr, "MGL WARN: mtlBlitFramebuffer: nothing to copy (mask=0x%zx)\n", mask);
+        return;
+    }
 
     // end encoding on current render encoder
     [self endRenderEncoding];
 
     // start blit encoder
-    id<MTLBlitCommandEncoder> blitCommandEncoder;
-    blitCommandEncoder = [_currentCommandBuffer blitCommandEncoder];
-    [blitCommandEncoder
-        copyFromTexture:readtexid sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(srcX0, srcY0, 0) sourceSize:MTLSizeMake(srcX1-srcX0, srcY1-srcY0, 1)
-        toTexture:drawtexid destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(dstX0, dstY0, 0) /*destinationSize:MTLSizeMake(dstX1, dstY1, 0)*/ ];
+    id<MTLBlitCommandEncoder> blitCommandEncoder = [_currentCommandBuffer blitCommandEncoder];
+    if (!blitCommandEncoder) {
+        fprintf(stderr, "MGL ERROR: mtlBlitFramebuffer: failed to create blit command encoder\n");
+        return;
+    }
+
+    size_t copyW = srcX1 - srcX0;
+    size_t copyH = srcY1 - srcY0;
+
+    for (int i = 0; i < copyCount; i++) {
+        id<MTLTexture> src = readTextures[i];
+        id<MTLTexture> dst = drawTextures[i];
+
+        // Clamp copy region to actual texture bounds
+        size_t safeW = MIN(copyW, MIN(src.width  - srcX0, dst.width  - dstX0));
+        size_t safeH = MIN(copyH, MIN(src.height - srcY0, dst.height - dstY0));
+
+        if (safeW == 0 || safeH == 0) {
+            fprintf(stderr, "MGL WARN: mtlBlitFramebuffer: zero-size copy region for layer %d\n", i);
+            continue;
+        }
+
+        [blitCommandEncoder
+            copyFromTexture:src sourceSlice:0 sourceLevel:0
+            sourceOrigin:MTLOriginMake(srcX0, srcY0, 0)
+            sourceSize:MTLSizeMake(safeW, safeH, 1)
+            toTexture:dst destinationSlice:0 destinationLevel:0
+            destinationOrigin:MTLOriginMake(dstX0, dstY0, 0)];
+    }
+
     [blitCommandEncoder endEncoding];
 
 }
