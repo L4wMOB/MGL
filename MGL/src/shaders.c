@@ -112,13 +112,37 @@ void initGLSLInput(GLMContext ctx, GLuint type, const char *src, glslang_input_t
      */
     input->client_version = GLSLANG_TARGET_OPENGL_450;
 
-    /* For legacy GLSL versions, replace #version directive in source copy */
+    /* For legacy GLSL versions, replace #version directive in source copy.
+     * Also rewrite shaders with version >= 330 that lack the 'core' keyword,
+     * because glslang defaults to compatibility profile without it, which
+     * rejects layout(binding=X) on UBOs. */
     static char *modified_src = NULL;
     static size_t modified_src_size = 0;
 
+    // Detect whether the existing #version line already has a profile keyword.
+    bool needs_rewrite = false;
     if (original_version < 330) {
-        fprintf(stderr, "[MGL] Upgrading GLSL shader from version %d to %d\n",
-                original_version, glsl_version);
+        needs_rewrite = true;  // must upgrade version number
+    } else if (version_str) {
+        // Check if 'core' or 'compatibility' already follows the version number.
+        const char *after_ver = version_str + strlen("#version");
+        while (*after_ver == ' ' || *after_ver == '\t') after_ver++;
+        // skip the version number digits
+        while (*after_ver >= '0' && *after_ver <= '9') after_ver++;
+        while (*after_ver == ' ' || *after_ver == '\t') after_ver++;
+        // If the next char is a newline or end-of-string, no profile is specified.
+        if (*after_ver == '\n' || *after_ver == '\r' || *after_ver == '\0') {
+            needs_rewrite = true;  // add 'core'
+        }
+    }
+
+    if (needs_rewrite) {
+        if (original_version < 330) {
+            fprintf(stderr, "[MGL] Upgrading GLSL shader from version %d to %d core\n",
+                    original_version, glsl_version);
+        } else {
+            fprintf(stderr, "[MGL] Adding 'core' profile to GLSL %d shader\n", glsl_version);
+        }
 
         size_t src_len = strlen(src);
         if (src_len + 100 > modified_src_size) {
@@ -146,22 +170,17 @@ void initGLSLInput(GLMContext ctx, GLuint type, const char *src, glslang_input_t
                     size_t old_len = newline - version_line;
                     size_t new_len = strlen(version_buf);
 
-                    fprintf(stderr, "[MGL] Old version line length: %zu, new: %zu\n", old_len, new_len);
-                    fprintf(stderr, "[MGL] Old line: %.*s\n", (int)old_len, version_line);
-
                     if (new_len <= old_len) {
                         /* Simple in-place replacement with space padding */
                         memset(version_line, ' ', old_len);
                         memcpy(version_line, version_buf, new_len);
-                        fprintf(stderr, "[MGL] Replaced version line in source (in-place)\n");
                     } else {
                         /* Need to shift the rest of the source */
                         size_t rest_of_src = strlen(newline);
-                        memmove(version_line + new_len, newline, rest_of_src + 1); /* +1 for null terminator */
+                        memmove(version_line + new_len, newline, rest_of_src + 1);
                         memcpy(version_line, version_buf, new_len);
-                        fprintf(stderr, "[MGL] Replaced version line with shift\n");
-                        fprintf(stderr, "[MGL] New line: %.*s\n", (int)new_len, version_line);
                     }
+                    fprintf(stderr, "[MGL] Rewrote version line to: %.*s\n", (int)new_len, version_line);
                 }
             }
             input->code = modified_src;
