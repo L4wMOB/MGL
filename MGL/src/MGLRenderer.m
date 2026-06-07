@@ -2356,16 +2356,30 @@ extern FBOAttachment *getFBOAttachment(GLMContext ctx, Framebuffer *fbo, GLenum 
     //int readtex, drawtex;
 
     readfbo = ctx->state.readbuffer;
-    assert(readfbo);
 
     id<MTLTexture> readtexid;
 
-    if (readfbo==NULL) {
-        assert(_drawable);
+    if (readfbo == NULL) {
+        // Default framebuffer — read from the current drawable
+        if (!_drawable) {
+            fprintf(stderr, "MGL ERROR: mtlBlitFramebuffer: no drawable for default read framebuffer\n");
+            return;
+        }
         readtexid = _drawable.texture;
     } else {
-        assert(readfbo);
-        FBOAttachment * fboa = getFBOAttachment(ctx, readfbo, STATE(read_buffer));
+        GLenum read_attach = STATE(read_buffer);
+        // When read_buffer is GL_NONE or a legacy front/back enum, fall back to
+        // COLOR_ATTACHMENT0 so we always have a valid attachment to blit from.
+        if (read_attach == GL_NONE ||
+            read_attach == GL_FRONT ||
+            read_attach == GL_BACK  ||
+            read_attach == GL_FRONT_LEFT  ||
+            read_attach == GL_FRONT_RIGHT ||
+            read_attach == GL_BACK_LEFT   ||
+            read_attach == GL_BACK_RIGHT) {
+            read_attach = GL_COLOR_ATTACHMENT0;
+        }
+        FBOAttachment * fboa = getFBOAttachment(ctx, readfbo, read_attach);
         assert(fboa);
         Texture * readtexobj;
         if (fboa->textarget == GL_RENDERBUFFER)
@@ -2385,13 +2399,31 @@ extern FBOAttachment *getFBOAttachment(GLMContext ctx, Framebuffer *fbo, GLenum 
     drawfbo = ctx->state.framebuffer;
 
     id<MTLTexture> drawtexid;
-    if (drawfbo==NULL) {
-        assert(_drawable);
+    if (drawfbo == NULL) {
+        // Default framebuffer — write to the current drawable
+        if (!_drawable) {
+            fprintf(stderr, "MGL ERROR: mtlBlitFramebuffer: no drawable for default draw framebuffer\n");
+            return;
+        }
         drawtexid = _drawable.texture;
     } else {
-        assert(drawfbo);
-        FBOAttachment * fboa = getFBOAttachment(ctx, drawfbo, STATE(draw_buffer));
-        assert(fboa);
+        GLenum draw_attach = STATE(draw_buffer);
+        // When draw_buffer is GL_NONE or a legacy front/back enum, fall back to
+        // COLOR_ATTACHMENT0 to avoid invalid attachment lookup.
+        if (draw_attach == GL_NONE ||
+            draw_attach == GL_FRONT ||
+            draw_attach == GL_BACK  ||
+            draw_attach == GL_FRONT_LEFT  ||
+            draw_attach == GL_FRONT_RIGHT ||
+            draw_attach == GL_BACK_LEFT   ||
+            draw_attach == GL_BACK_RIGHT) {
+            draw_attach = GL_COLOR_ATTACHMENT0;
+        }
+        FBOAttachment * fboa = getFBOAttachment(ctx, drawfbo, draw_attach);
+        if (!fboa) {
+            fprintf(stderr, "MGL ERROR: mtlBlitFramebuffer: no draw attachment for enum 0x%x\n", draw_attach);
+            return;
+        }
         Texture * drawtexobj;
         if (fboa->textarget == GL_RENDERBUFFER)
         {
@@ -2401,9 +2433,11 @@ extern FBOAttachment *getFBOAttachment(GLMContext ctx, Framebuffer *fbo, GLenum 
         {
             drawtexobj = fboa->buf.tex;
         }
-        assert(drawtexobj);
+        if (!drawtexobj || !drawtexobj->mtl_data) {
+            fprintf(stderr, "MGL ERROR: mtlBlitFramebuffer: draw texture not yet allocated\n");
+            return;
+        }
         drawtexid = (__bridge id<MTLTexture>)(drawtexobj->mtl_data);
-        assert(drawtexid);
     }
 
 
