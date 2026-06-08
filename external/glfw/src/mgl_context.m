@@ -14,6 +14,9 @@
 
 #include <unistd.h>
 #include <math.h>
+#include <dlfcn.h>
+#include <limits.h>
+#include <string.h>
 
 #define GL_BGRA                           0x80E1
 #define GL_UNSIGNED_INT_8_8_8_8_REV       0x8367
@@ -25,8 +28,12 @@ GLMContext createGLMContext(GLenum format, GLenum type,
                         GLenum depth_format, GLenum depth_type,
                         GLenum stencil_format, GLenum stencil_type);
 
+void MGLsetDefaultFramebufferSRGBCapable(GLMContext ctx, GLboolean capable);
+
 void MGLsetCurrentContext(GLMContext ctx);
+GLMContext MGLgetCurrentContext(void);
 void MGLswapBuffers(GLMContext ctx);
+void destroyGLMContext(GLMContext ctx);
 
 static void makeContextCurrentMGL(_GLFWwindow* window)
 {
@@ -40,10 +47,8 @@ static void makeContextCurrentMGL(_GLFWwindow* window)
     }
     else
     {
-        // just so we have jump tables
-        MGLsetCurrentContext(createGLMContext(0, 0,
-                                              0, 0,
-                                              0, 0));
+        MGLsetCurrentContext(NULL);
+        _glfwPlatformSetTls(&_glfw.contextSlot, NULL);
     }
 
     } // autoreleasepool
@@ -61,26 +66,56 @@ static void swapIntervalMGL(int interval)
 
 static int extensionSupportedMGL(const char* extension)
 {
-    // There are no MGL extensions
+    if (!extension) {
+        return GLFW_FALSE;
+    }
+
+    static const char* supportedExtensions[] = {
+        "GL_ARB_vertex_array_object",
+        "GL_ARB_framebuffer_object",
+        "GL_ARB_texture_storage",
+        "GL_ARB_sampler_objects",
+        "GL_ARB_uniform_buffer_object",
+        "GL_ARB_draw_buffers",
+        "GL_ARB_debug_output",
+        "GL_ARB_texture_buffer_object",
+        "GL_ARB_texture_buffer_range",
+        "GL_ARB_buffer_storage",
+        "GL_ARB_direct_state_access"
+    };
+
+    for (size_t i = 0; i < sizeof(supportedExtensions) / sizeof(supportedExtensions[0]); i++) {
+        if (strcmp(extension, supportedExtensions[i]) == 0) {
+            return GLFW_TRUE;
+        }
+    }
+
     return GLFW_FALSE;
 }
 
 static GLFWglproc getProcAddressMGL(const char* procname)
 {
     GLFWproc symbol;
-
-    assert(_glfw.mgl.handle);
+    if (!_glfw.mgl.handle)
+        return NULL;
 
     symbol = _glfwPlatformGetModuleSymbol(_glfw.mgl.handle, procname);
-    assert(symbol);
-
     return symbol;
 }
 
 static void destroyContextMGL(_GLFWwindow* window)
 {
     @autoreleasepool {
+        if (!window)
+            return;
 
+        if (window->context.mgl.ctx)
+        {
+            destroyGLMContext(window->context.mgl.ctx);
+            window->context.mgl.ctx = NULL;
+        }
+
+        window->context.mgl.renderer = nil;
 
     } // autoreleasepool
 }
@@ -94,11 +129,36 @@ static void destroyContextMGL(_GLFWwindow* window)
 //
 GLFWbool _glfwInitMGL(void)
 {
+    Dl_info info;
+    char modulePath[PATH_MAX];
+    const char* slash;
+
     if (_glfw.mgl.handle)
         return GLFW_TRUE;
 
+    // Fast path: rely on platform loader search rules first.
     _glfw.mgl.handle = _glfwPlatformLoadModule("libmgl.dylib");
-    assert(_glfw.mgl.handle);
+
+    // Robust fallback for Java/LWJGL launchers: load libmgl from the same
+    // directory as the currently loaded libglfw.dylib.
+    if (_glfw.mgl.handle == NULL &&
+        dladdr((const void*) _glfwInitMGL, &info) != 0 &&
+        info.dli_fname != NULL)
+    {
+        slash = strrchr(info.dli_fname, '/');
+        if (slash)
+        {
+            size_t dirLen = (size_t) (slash - info.dli_fname);
+            if (dirLen + 1 + strlen("libmgl.dylib") + 1 < sizeof(modulePath))
+            {
+                memcpy(modulePath, info.dli_fname, dirLen);
+                modulePath[dirLen] = '/';
+                strcpy(modulePath + dirLen + 1, "libmgl.dylib");
+                modulePath[dirLen + 1 + strlen("libmgl.dylib")] = '\0';
+                _glfw.mgl.handle = _glfwPlatformLoadModule(modulePath);
+            }
+        }
+    }
 
     if (_glfw.mgl.handle == NULL)
     {
@@ -129,17 +189,13 @@ GLFWbool _glfwCreateContextMGL(_GLFWwindow* window,
         return GLFW_FALSE;
     }
 
-    if (ctxconfig->major < 4)
+    // MGL internally targets a modern core feature set, but the OpenGL CTS
+    // covers GL 3.0/3.1 packages before moving to 3.2+ core profile contexts.
+    if (ctxconfig->major < 3 ||
+        (ctxconfig->major == 3 && ctxconfig->minor < 0))
     {
         _glfwInputError(GLFW_VERSION_UNAVAILABLE,
-                        "MGL: OpenGL 4.6 and above supported on MGL");
-        return GLFW_FALSE;
-    }
-
-    if (ctxconfig->minor < 6)
-    {
-        _glfwInputError(GLFW_VERSION_UNAVAILABLE,
-                        "MGL: OpenGL 4.6 and above supported on MGL");
+                        "MGL: OpenGL 3.0+ required");
         return GLFW_FALSE;
     }
 
@@ -147,7 +203,14 @@ GLFWbool _glfwCreateContextMGL(_GLFWwindow* window,
                                                GL_DEPTH_COMPONENT, GL_FLOAT,
                                                0, 0);
     assert(window->context.mgl.ctx);
-
+    
+    // Apply GLFW_SRGB_CAPABLE hint to the default framebuffer.
+    // When enabled, the Metal drawable will use _sRGB pixel format so that
+    // fragment shader outputs are automatically encoded to sRGB on write.
+    if (fbconfig && fbconfig->sRGB) {
+        MGLsetDefaultFramebufferSRGBCapable(window->context.mgl.ctx, GLFW_TRUE);
+    }
+    
     if (window->context.mgl.ctx == nil)
     {
         _glfwInputError(GLFW_VERSION_UNAVAILABLE,
@@ -160,7 +223,7 @@ GLFWbool _glfwCreateContextMGL(_GLFWwindow* window,
     MGLRenderer *renderer = [[MGLRenderer alloc] init];
     assert(renderer);
 
-    window->context.mgl.renderer = renderer;
+    window->context.mgl.renderer = (id)CFBridgingRetain(renderer);
 
     [window->context.mgl.renderer createMGLRendererAndBindToContext: window->context.mgl.ctx view: window->ns.view];
 
@@ -172,6 +235,10 @@ GLFWbool _glfwCreateContextMGL(_GLFWwindow* window,
     window->context.extensionSupported = extensionSupportedMGL;
     window->context.getProcAddress = getProcAddressMGL;
     window->context.destroy = destroyContextMGL;
+
+    // Keep behavior robust for callers that create capabilities immediately
+    // after window creation.
+    makeContextCurrentMGL(window);
 
     return GLFW_TRUE;
 }
@@ -201,4 +268,3 @@ GLFWAPI void * glfwGetMGLContext(GLFWwindow* handle)
 
     return window->context.mgl.ctx;
 }
-
