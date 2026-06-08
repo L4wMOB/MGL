@@ -5817,12 +5817,27 @@ void mglGetTexImage(GLMContext ctx, GLenum target, GLint level, GLenum format, G
             ERROR_RETURN(GL_INVALID_ENUM);
             return;
     }
+    // Resolve destination: either a PBO-offset or a direct CPU pointer.
     if (STATE(buffers[_PIXEL_PACK_BUFFER])) {
-        fprintf(stderr, "MGL WARNING: glGetTexImage with GL_PIXEL_PACK_BUFFER is unsupported\n");
-        ERROR_RETURN(GL_INVALID_OPERATION);
-        return;
-    }
-    if (!pixels) {
+        Buffer *pbo = STATE(buffers[_PIXEL_PACK_BUFFER]);
+        if (pbo->mapped) {
+            fprintf(stderr, "MGL ERROR: glGetTexImage: pixel pack buffer %u is mapped\n", pbo->name);
+            ERROR_RETURN(GL_INVALID_OPERATION);
+            return;
+        }
+        uint8_t *pbo_base = (uint8_t *)getBufferData(ctx, pbo);
+        if (!pbo_base) {
+            fprintf(stderr, "MGL ERROR: glGetTexImage: pixel pack buffer %u has no CPU storage\n", pbo->name);
+            ERROR_RETURN(GL_INVALID_OPERATION);
+            return;
+        }
+        uintptr_t offset = (uintptr_t)pixels;
+        if ((size_t)pbo->size < offset) {
+            ERROR_RETURN(GL_INVALID_VALUE);
+            return;
+        }
+        pixels = (void *)(pbo_base + offset);
+    } else if (!pixels) {
         ERROR_RETURN(GL_INVALID_OPERATION);
         return;
     }
@@ -5899,16 +5914,31 @@ void mglGetTextureImage(GLMContext ctx, GLuint texture, GLint level, GLenum form
         ERROR_RETURN(GL_INVALID_VALUE);
         return;
     }
+    // Resolve destination: either a PBO-offset or a direct CPU pointer.
     if (STATE(buffers[_PIXEL_PACK_BUFFER])) {
-        fprintf(stderr, "MGL WARNING: glGetTextureImage with GL_PIXEL_PACK_BUFFER is unsupported\n");
+        Buffer *pbo = STATE(buffers[_PIXEL_PACK_BUFFER]);
+        if (pbo->mapped) {
+            fprintf(stderr, "MGL ERROR: glGetTextureImage: pixel pack buffer %u is mapped\n", pbo->name);
+            ERROR_RETURN(GL_INVALID_OPERATION);
+            return;
+        }
+        uint8_t *pbo_base = (uint8_t *)getBufferData(ctx, pbo);
+        if (!pbo_base) {
+            fprintf(stderr, "MGL ERROR: glGetTextureImage: pixel pack buffer %u has no CPU storage\n", pbo->name);
+            ERROR_RETURN(GL_INVALID_OPERATION);
+            return;
+        }
+        uintptr_t offset = (uintptr_t)pixels;
+        if ((size_t)pbo->size < offset) {
+            ERROR_RETURN(GL_INVALID_VALUE);
+            return;
+        }
+        pixels = (void *)(pbo_base + offset);
+    } else if (!pixels && bufSize > 0) {
         ERROR_RETURN(GL_INVALID_OPERATION);
         return;
     }
-    if (!pixels && bufSize > 0) {
-        ERROR_RETURN(GL_INVALID_OPERATION);
-        return;
-    }
-    
+
     Texture *tex = getTex(ctx, texture, 0);
     if (!tex) {
         ERROR_RETURN(GL_INVALID_OPERATION);
@@ -5991,16 +6021,31 @@ void mglGetTextureSubImage(GLMContext ctx, GLuint texture, GLint level, GLint xo
     if (width == 0 || height == 0 || depth == 0) {
         return;
     }
+    // Resolve destination: either a PBO-offset or a direct CPU pointer.
     if (STATE(buffers[_PIXEL_PACK_BUFFER])) {
-        fprintf(stderr, "MGL WARNING: glGetTextureSubImage with GL_PIXEL_PACK_BUFFER is unsupported\n");
+        Buffer *pbo = STATE(buffers[_PIXEL_PACK_BUFFER]);
+        if (pbo->mapped) {
+            fprintf(stderr, "MGL ERROR: glGetTextureSubImage: pixel pack buffer %u is mapped\n", pbo->name);
+            ERROR_RETURN(GL_INVALID_OPERATION);
+            return;
+        }
+        uint8_t *pbo_base = (uint8_t *)getBufferData(ctx, pbo);
+        if (!pbo_base) {
+            fprintf(stderr, "MGL ERROR: glGetTextureSubImage: pixel pack buffer %u has no CPU storage\n", pbo->name);
+            ERROR_RETURN(GL_INVALID_OPERATION);
+            return;
+        }
+        uintptr_t offset = (uintptr_t)pixels;
+        if ((size_t)pbo->size < offset) {
+            ERROR_RETURN(GL_INVALID_VALUE);
+            return;
+        }
+        pixels = (void *)(pbo_base + offset);
+    } else if (!pixels) {
         ERROR_RETURN(GL_INVALID_OPERATION);
         return;
     }
-    if (!pixels) {
-        ERROR_RETURN(GL_INVALID_OPERATION);
-        return;
-    }
-    
+
     Texture *tex = getTex(ctx, texture, 0);
     if (!tex || !tex->mtl_data) {
         ERROR_RETURN(GL_INVALID_OPERATION);
