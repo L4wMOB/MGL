@@ -2690,7 +2690,15 @@ static void mglApplyMinecraftRenderPipelineStateFallback(GLMContext glctx)
         }
     } else if (depth3DProgram && !lightmapTarget) {
         bool targetCanUseDepth = defaultTarget || targetHasDepthAttachment;
-        if (targetCanUseDepth && !glctx->state.caps.depth_test) {
+        // For non-default targets (e.g. Sodium's offscreen FBO), only force depth
+        // state when the FBO actually has a depth attachment.  Forcing depth_test on
+        // an FBO that has no depth attachment causes a per-draw-call fallback loop
+        // (the renderer toggles depth_test off for 2D/GUI draws; we would immediately
+        // override it back, costing hundreds of NSLog lines and state flushes per
+        // second and dropping FPS to single digits).
+        bool shouldForceDepth = defaultTarget ? targetCanUseDepth
+                                              : targetHasDepthAttachment;
+        if (shouldForceDepth && !glctx->state.caps.depth_test) {
             reason = "depth3d-enable-depth";
             glctx->state.caps.depth_test = GL_TRUE;
             dirty |= DIRTY_RENDER_STATE;
@@ -2698,14 +2706,14 @@ static void mglApplyMinecraftRenderPipelineStateFallback(GLMContext glctx)
                 dirty |= DIRTY_FBO;
             }
         }
-        if (targetCanUseDepth &&
+        if (shouldForceDepth &&
             glctx->state.var.depth_func != GL_LESS &&
             glctx->state.var.depth_func != GL_LEQUAL) {
             reason = reason ? reason : "depth3d-depth-func";
             glctx->state.var.depth_func = GL_LEQUAL;
             dirty |= DIRTY_RENDER_STATE;
         }
-        if (targetCanUseDepth &&
+        if (shouldForceDepth &&
             !glctx->state.caps.blend &&
             !glctx->state.var.depth_writemask) {
             reason = reason ? reason : "depth3d-depth-write";
