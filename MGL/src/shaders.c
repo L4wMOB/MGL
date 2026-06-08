@@ -20,6 +20,8 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
 #include <glslang_c_interface.h>
 #include <glslang_c_shader_types.h>
 
@@ -28,13 +30,274 @@
 
 const glslang_resource_t* glslang_default_resource(void);
 
+#define MGL_MAX_UBO_BINDINGS 512
+
+typedef struct {
+    char *name;
+    int binding;
+} MGLUBOBindingEntry;
+
+static MGLUBOBindingEntry s_ubo_binding_entries[MGL_MAX_UBO_BINDINGS];
+static int s_ubo_binding_count = 0;
+
+static int mgl_get_or_assign_ubo_binding(const char *block_name)
+{
+    if (!block_name || !block_name[0]) {
+        return 0;
+    }
+
+    for (int i = 0; i < s_ubo_binding_count; i++) {
+        if (s_ubo_binding_entries[i].name && strcmp(s_ubo_binding_entries[i].name, block_name) == 0) {
+            return s_ubo_binding_entries[i].binding;
+        }
+    }
+
+    if (s_ubo_binding_count >= MGL_MAX_UBO_BINDINGS) {
+        /* Fallback: deterministic but bounded binding index */
+        unsigned hash = 2166136261u;
+        for (const char *p = block_name; *p; p++) {
+            hash ^= (unsigned char)*p;
+            hash *= 16777619u;
+        }
+        return (int)(hash % 256u);
+    }
+
+    s_ubo_binding_entries[s_ubo_binding_count].name = strdup(block_name);
+    s_ubo_binding_entries[s_ubo_binding_count].binding = s_ubo_binding_count;
+    s_ubo_binding_count++;
+    return s_ubo_binding_entries[s_ubo_binding_count - 1].binding;
+}
+
+static void mgl_patch_uniform_block_bindings(char *src, size_t src_capacity)
+{
+    static const char *patterns[] = {
+        "layout(std140) uniform ",
+        "layout(std430) uniform "
+    };
+    char *cursor = src;
+
+    if (!src || src_capacity == 0) {
+        return;
+    }
+
+    while (*cursor) {
+        char *match = NULL;
+        const char *pat = NULL;
+        size_t pat_len = 0;
+        for (int i = 0; i < 2; i++) {
+            char *p = strstr(cursor, patterns[i]);
+            if (p && (!match || p < match)) {
+                match = p;
+                pat = patterns[i];
+                pat_len = strlen(patterns[i]);
+            }
+        }
+
+        if (!match) {
+            break;
+        }
+
+        char *name_start = match + pat_len;
+        while (*name_start && isspace((unsigned char)*name_start)) {
+            name_start++;
+        }
+        if (!isalpha((unsigned char)*name_start) && *name_start != '_') {
+            cursor = match + pat_len;
+            continue;
+        }
+
+        char block_name[128];
+        size_t bn = 0;
+        char *p = name_start;
+        while ((*p == '_' || isalnum((unsigned char)*p)) && bn + 1 < sizeof(block_name)) {
+            block_name[bn++] = *p++;
+        }
+        block_name[bn] = '\0';
+
+        if (bn == 0) {
+            cursor = match + pat_len;
+            continue;
+        }
+
+        int binding = mgl_get_or_assign_ubo_binding(block_name);
+        char replacement[96];
+        if (strncmp(pat, "layout(std140)", 14) == 0) {
+            snprintf(replacement, sizeof(replacement), "layout(std140, binding = %d) uniform ", binding);
+        } else {
+            snprintf(replacement, sizeof(replacement), "layout(std430, binding = %d) uniform ", binding);
+        }
+
+        size_t repl_len = strlen(replacement);
+        if (repl_len <= pat_len) {
+            memcpy(match, replacement, repl_len);
+            if (repl_len < pat_len) {
+                memset(match + repl_len, ' ', pat_len - repl_len);
+            }
+            cursor = match + pat_len;
+        } else {
+            size_t tail_len = strlen(match + pat_len);
+            size_t used = strlen(src);
+            size_t grow = repl_len - pat_len;
+            if (used + grow + 1 >= src_capacity) {
+                /* No room to grow safely; skip this block */
+                cursor = match + pat_len;
+                continue;
+            }
+            memmove(match + repl_len, match + pat_len, tail_len + 1);
+            memcpy(match, replacement, repl_len);
+            cursor = match + repl_len;
+        }
+    }
+}
+
+static void mgl_ensure_420pack_extension(char *src, size_t src_capacity)
+{
+    const char *ext_line = "#extension GL_ARB_shading_language_420pack : require\n";
+    size_t ext_len = strlen(ext_line);
+    char *version_line;
+    char *newline;
+    size_t used;
+
+    if (!src || src_capacity == 0) {
+        return;
+    }
+    if (!strstr(src, "binding = ")) {
+        return;
+    }
+    if (strstr(src, "GL_ARB_shading_language_420pack")) {
+        return;
+    }
+
+    version_line = strstr(src, "#version");
+    if (!version_line) {
+        return;
+    }
+    newline = strchr(version_line, '\n');
+    if (!newline) {
+        return;
+    }
+
+    used = strlen(src);
+    if (used + ext_len + 1 >= src_capacity) {
+        return;
+    }
+
+    memmove(newline + 1 + ext_len, newline + 1, strlen(newline + 1) + 1);
+    memcpy(newline + 1, ext_line, ext_len);
+}
+
+static void mgl_upgrade_version_for_bindings(char *src)
+{
+    char *version_line;
+    int version = 0;
+    char profile[32] = {0};
+    char replacement[64];
+    char *newline;
+    size_t old_len;
+    size_t new_len;
+
+    if (!src) {
+        return;
+    }
+    if (!strstr(src, "binding = ")) {
+        return;
+    }
+
+    version_line = strstr(src, "#version");
+    if (!version_line) {
+        return;
+    }
+
+    if (sscanf(version_line, "#version %d %31s", &version, profile) < 1) {
+        return;
+    }
+    if (version >= 420) {
+        return;
+    }
+
+    newline = strchr(version_line, '\n');
+    if (!newline) {
+        return;
+    }
+
+    snprintf(replacement, sizeof(replacement), "#version 420 core");
+    old_len = (size_t)(newline - version_line);
+    new_len = strlen(replacement);
+
+    if (new_len <= old_len) {
+        memset(version_line, ' ', old_len);
+        memcpy(version_line, replacement, new_len);
+    } else {
+        size_t rest = strlen(newline);
+        memmove(version_line + new_len, newline, rest + 1);
+        memcpy(version_line, replacement, new_len);
+    }
+}
+
+static int mgl_is_identifier_char(int c)
+{
+    return c == '_' || isalnum((unsigned char)c);
+}
+
+static void mgl_replace_glsl_identifier_with_shorter(char *src,
+                                                     const char *needle,
+                                                     const char *replacement)
+{
+    size_t needle_len;
+    size_t replacement_len;
+    char *cursor;
+
+    if (!src || !needle || !replacement) {
+        return;
+    }
+
+    needle_len = strlen(needle);
+    replacement_len = strlen(replacement);
+    if (needle_len == 0 || replacement_len > needle_len) {
+        return;
+    }
+
+    cursor = src;
+    while ((cursor = strstr(cursor, needle)) != NULL) {
+        int before = cursor == src ? 0 : cursor[-1];
+        int after = cursor[needle_len];
+        if (mgl_is_identifier_char(before) || mgl_is_identifier_char(after)) {
+            cursor += needle_len;
+            continue;
+        }
+
+        memcpy(cursor, replacement, replacement_len);
+        if (replacement_len < needle_len) {
+            memmove(cursor + replacement_len,
+                    cursor + needle_len,
+                    strlen(cursor + needle_len) + 1);
+        }
+        cursor += replacement_len;
+    }
+}
+
+static void mgl_downgrade_derivative_control_intrinsics(char *src)
+{
+    if (!src || (!strstr(src, "Fine") && !strstr(src, "Coarse"))) {
+        return;
+    }
+
+    mgl_replace_glsl_identifier_with_shorter(src, "dFdxFine", "dFdx");
+    mgl_replace_glsl_identifier_with_shorter(src, "dFdyFine", "dFdy");
+    mgl_replace_glsl_identifier_with_shorter(src, "fwidthFine", "fwidth");
+    mgl_replace_glsl_identifier_with_shorter(src, "dFdxCoarse", "dFdx");
+    mgl_replace_glsl_identifier_with_shorter(src, "dFdyCoarse", "dFdy");
+    mgl_replace_glsl_identifier_with_shorter(src, "fwidthCoarse", "fwidth");
+}
+
 const char *getShaderTypeStr(GLuint type)
 {
     static const char *types[] = {"VERTEX_SHADER", "FRAGMENT_SHADER",
         "GEOMETRY_SHADER", "TESS_CONTROL_SHADER", "TESS_EVALUATION_SHADER",
         "COMPUTE_SHADER", "MAX_SHADER_TYPES", NULL};
 
-    assert(type < _MAX_SHADER_TYPES);
+    if (type >= _MAX_SHADER_TYPES)
+        return "UNKNOWN_SHADER";
 
     return types[type];
 };
@@ -107,227 +370,85 @@ void initGLSLInput(GLMContext ctx, GLuint type, const char *src, glslang_input_t
      * Must be set AFTER version detection above
      *
      * Note: glslang only exposes GLSLANG_TARGET_OPENGL_450, so we use that
-     * as the SPIR-V target for all modern GLSL versions.
-     * Always use OPENGL_450 — it is the only valid OpenGL target enum in glslang.
+     * as the SPIR-V target for all modern GLSL versions
+     */
+    /* GLSLANG_TARGET_OPENGL_450 is the only valid OpenGL target enum in glslang.
+     * Using raw integer 330 is invalid and causes glslang to reject layout(binding=X).
+     * mgl_upgrade_version_for_bindings() will rewrite the #version line to 420 core
+     * when bindings are present, so glslang will validate against a compatible version.
      */
     input->client_version = GLSLANG_TARGET_OPENGL_450;
 
-    /* For legacy GLSL versions, replace #version directive in source copy.
-     * Also rewrite shaders with version >= 330 that lack the 'core' keyword,
-     * because glslang defaults to compatibility profile without it, which
-     * rejects layout(binding=X) on UBOs. */
+    /* Build a mutable source copy for compatibility rewrites. */
     static char *modified_src = NULL;
     static size_t modified_src_size = 0;
-
-    // Detect whether the existing #version line already has a profile keyword.
-    bool needs_rewrite = false;
-    if (original_version < 330) {
-        needs_rewrite = true;  // must upgrade version number
-    } else if (version_str) {
-        // Check if 'core' or 'compatibility' already follows the version number.
-        const char *after_ver = version_str + strlen("#version");
-        while (*after_ver == ' ' || *after_ver == '\t') after_ver++;
-        // skip the version number digits
-        while (*after_ver >= '0' && *after_ver <= '9') after_ver++;
-        while (*after_ver == ' ' || *after_ver == '\t') after_ver++;
-        // If the next char is a newline or end-of-string, no profile is specified.
-        if (*after_ver == '\n' || *after_ver == '\r' || *after_ver == '\0') {
-            needs_rewrite = true;  // add 'core'
-        }
+    size_t src_len = strlen(src);
+    if (src_len + 2048 > modified_src_size) {
+        modified_src_size = src_len + 2048;
+        free(modified_src);
+        modified_src = (char *)malloc(modified_src_size);
     }
 
-    if (needs_rewrite) {
+    if (!modified_src) {
+        fprintf(stderr, "[MGL] ERROR: Failed to allocate modified_src\n");
+        input->code = src;
+    } else {
+        strcpy(modified_src, src);
+
         if (original_version < 330) {
-            fprintf(stderr, "[MGL] Upgrading GLSL shader from version %d to %d core\n",
+            fprintf(stderr, "[MGL] Upgrading GLSL shader from version %d to %d\n",
                     original_version, glsl_version);
-        } else {
-            fprintf(stderr, "[MGL] Adding 'core' profile to GLSL %d shader\n", glsl_version);
-        }
-
-        size_t src_len = strlen(src);
-        if (src_len + 100 > modified_src_size) {
-            modified_src_size = src_len + 100;
-            free(modified_src);
-            modified_src = (char *)malloc(modified_src_size);
-        }
-
-        if (modified_src) {
-            strcpy(modified_src, src);
 
             /* Find and replace #version line */
             char *version_line = strstr(modified_src, "#version");
             if (!version_line) {
                 fprintf(stderr, "[MGL] WARNING: #version not found in source\n");
-                input->code = src;
             } else {
                 char *newline = strchr(version_line, '\n');
                 if (!newline) {
                     fprintf(stderr, "[MGL] WARNING: newline not found after #version\n");
-                    input->code = src;
                 } else {
                     char version_buf[64];
                     snprintf(version_buf, sizeof(version_buf), "#version %d core", glsl_version);
-                    size_t old_len = newline - version_line;
+                    size_t old_len = (size_t)(newline - version_line);
                     size_t new_len = strlen(version_buf);
 
                     if (new_len <= old_len) {
-                        /* Simple in-place replacement with space padding */
                         memset(version_line, ' ', old_len);
                         memcpy(version_line, version_buf, new_len);
                     } else {
-                        /* Need to shift the rest of the source */
                         size_t rest_of_src = strlen(newline);
                         memmove(version_line + new_len, newline, rest_of_src + 1);
                         memcpy(version_line, version_buf, new_len);
                     }
-                    fprintf(stderr, "[MGL] Rewrote version line to: %.*s\n", (int)new_len, version_line);
                 }
             }
-            input->code = modified_src;
-        } else {
-            fprintf(stderr, "[MGL] ERROR: Failed to allocate modified_src\n");
-            input->code = src;
         }
-    } else {
-        input->code = src;
+
+        /* Inject explicit UBO bindings for desktop GLSL sources that omit them.
+         * Newer glslang/SPIR-V paths may require these at parse time. */
+        mgl_patch_uniform_block_bindings(modified_src, modified_src_size);
+        mgl_upgrade_version_for_bindings(modified_src);
+        mgl_ensure_420pack_extension(modified_src, modified_src_size);
+        mgl_downgrade_derivative_control_intrinsics(modified_src);
+
+        if (strstr(modified_src, "#version 420") != NULL && glsl_version < 420) {
+            glsl_version = 420;
+        }
+
+        input->code = modified_src;
     }
 
     input->default_version = glsl_version;
     input->default_profile = GLSLANG_CORE_PROFILE;
-    input->messages = GLSLANG_MSG_DEFAULT_BIT | GLSLANG_MSG_DEBUG_INFO_BIT | GLSLANG_MSG_RELAXED_ERRORS_BIT;
+    /* Use relaxed OpenGL-style validation at shader compile stage.
+     * Program-level link/map_io will assign/validate resource interfaces.
+     * This avoids forcing explicit layout(binding=...) in vanilla MC GLSL 330.
+     */
+    input->messages = GLSLANG_MSG_RELAXED_ERRORS_BIT;
     input->resource = glslang_default_resource();
+
     input->force_default_version_and_profile = 0;
-
-    /* -----------------------------------------------------------------------
-     * AUTO-INJECT layout(binding=N) for uniform/buffer blocks that lack it.
-     *
-     * glslang targeting SPIR-V requires every UBO/SSBO to have an explicit
-     * binding= qualifier.  Minecraft 1.21 shaders use layout(std140) without
-     * binding=, which is valid GLSL 3.30 but illegal in SPIR-V mode.
-     *
-     * Strategy: scan the (already version-patched) source for occurrences of
-     *   layout(...) uniform <Name> {
-     *   layout(...) buffer  <Name> {
-     * where the layout qualifier does NOT already contain "binding".  For each
-     * such block found, rewrite "layout(std140)" → "layout(std140, binding=N)"
-     * incrementing N.  We allocate a fresh buffer large enough to hold the
-     * expanded text.
-     * ----------------------------------------------------------------------- */
-    {
-        const char *in_src = input->code;  // may point to modified_src or src
-        size_t in_len = strlen(in_src);
-
-        /* Upper-bound: each "layout(" → "layout(binding=99, " adds ~14 chars,
-         * and there are at most a handful of UBOs per shader.  Add 2KB slack. */
-        size_t out_max = in_len + 2048;
-        char *out = (char *)malloc(out_max);
-        if (!out) {
-            /* OOM — leave source unchanged */
-            goto done_inject;
-        }
-
-        char *dst = out;
-        const char *p   = in_src;
-        int binding_idx = 0;
-        bool modified   = false;
-
-        while (*p) {
-            /* Look for "layout" */
-            const char *layout_pos = strstr(p, "layout");
-            if (!layout_pos) {
-                /* Copy remainder verbatim */
-                size_t tail = strlen(p);
-                memcpy(dst, p, tail);
-                dst += tail;
-                p += tail;
-                break;
-            }
-
-            /* Copy everything up to "layout" */
-            size_t prefix = layout_pos - p;
-            memcpy(dst, p, prefix);
-            dst += prefix;
-            p = layout_pos;
-
-            /* Scan the layout(...) qualifier */
-            const char *open = strchr(p, '(');
-            if (!open) {
-                /* malformed — copy char and move on */
-                *dst++ = *p++;
-                continue;
-            }
-            const char *close = strchr(open, ')');
-            if (!close) {
-                *dst++ = *p++;
-                continue;
-            }
-
-            /* Grab qualifier text between ( and ) */
-            size_t qual_len = close - open - 1;  /* excluding parens */
-            char qual[256] = {0};
-            if (qual_len < sizeof(qual))
-                memcpy(qual, open + 1, qual_len);
-            else {
-                /* Too long — copy verbatim */
-                size_t chunk = close - p + 1;
-                memcpy(dst, p, chunk);
-                dst += chunk;
-                p = close + 1;
-                continue;
-            }
-
-            /* Check whether what follows is "uniform <name> {" or "buffer <name> {" */
-            const char *after_close = close + 1;
-            while (*after_close == ' ' || *after_close == '\t') after_close++;
-
-            bool is_block = (strncmp(after_close, "uniform", 7) == 0 ||
-                             strncmp(after_close, "buffer",  6) == 0);
-
-            /* Check if "binding" already present in qualifier */
-            bool has_binding = (strstr(qual, "binding") != NULL);
-
-            if (is_block && !has_binding) {
-                /* Inject binding=N into the qualifier */
-                char new_qual[320];
-                if (qual_len > 0)
-                    snprintf(new_qual, sizeof(new_qual), "layout(%s, binding=%d)", qual, binding_idx);
-                else
-                    snprintf(new_qual, sizeof(new_qual), "layout(binding=%d)", binding_idx);
-                binding_idx++;
-                size_t nql = strlen(new_qual);
-                memcpy(dst, new_qual, nql);
-                dst += nql;
-                p = close + 1;  /* skip past original "layout(...)" */
-                modified = true;
-            } else {
-                /* Copy original layout(...) verbatim */
-                size_t chunk = close - p + 1;
-                memcpy(dst, p, chunk);
-                dst += chunk;
-                p = close + 1;
-            }
-        }
-
-        *dst = '\0';
-
-        if (modified) {
-            /* Replace input->code with the patched version.
-             * We reuse the modified_src static buffer if it is large enough,
-             * otherwise keep the malloc'd buffer and point input->code at it.
-             * NOTE: we intentionally keep the malloc alive for the duration of
-             * the glslang_shader_preprocess call; glslang only reads input->code
-             * during that call so freeing afterwards is safe.  We store the
-             * pointer in a second static to free on next call. */
-            static char *inject_buf = NULL;
-            free(inject_buf);
-            inject_buf = out;  /* transfer ownership */
-            input->code = inject_buf;
-            fprintf(stderr, "[MGL] Auto-injected binding qualifiers into %d UBO/SSBO block(s)\n", binding_idx);
-        } else {
-            free(out);
-        }
-        done_inject:;
-    }
 }
 
 Shader *newShader(GLMContext ctx, GLenum type, GLuint shader)
@@ -424,10 +545,37 @@ void mglFreeShader(GLMContext ctx, Shader *ptr)
         glslang_shader_delete(ptr->compiled_glsl_shader);
     }
 
-    if (ptr->mtl_data.library)
+    if (ptr->mtl_data.function)
     {
         ctx->mtl_funcs.mtlDeleteMTLObj(ctx, ptr->mtl_data.function);
+    }
+    if (ptr->mtl_data.library)
+    {
         ctx->mtl_funcs.mtlDeleteMTLObj(ctx, ptr->mtl_data.library);
+    }
+    if (ptr->mtl_data.zero_to_one_function)
+    {
+        ctx->mtl_funcs.mtlDeleteMTLObj(ctx, ptr->mtl_data.zero_to_one_function);
+    }
+    if (ptr->mtl_data.zero_to_one_library)
+    {
+        ctx->mtl_funcs.mtlDeleteMTLObj(ctx, ptr->mtl_data.zero_to_one_library);
+    }
+    if (ptr->mtl_data.upper_left_function)
+    {
+        ctx->mtl_funcs.mtlDeleteMTLObj(ctx, ptr->mtl_data.upper_left_function);
+    }
+    if (ptr->mtl_data.upper_left_library)
+    {
+        ctx->mtl_funcs.mtlDeleteMTLObj(ctx, ptr->mtl_data.upper_left_library);
+    }
+    if (ptr->mtl_data.upper_left_zero_to_one_function)
+    {
+        ctx->mtl_funcs.mtlDeleteMTLObj(ctx, ptr->mtl_data.upper_left_zero_to_one_function);
+    }
+    if (ptr->mtl_data.upper_left_zero_to_one_library)
+    {
+        ctx->mtl_funcs.mtlDeleteMTLObj(ctx, ptr->mtl_data.upper_left_zero_to_one_library);
     }
 
     free((void *)ptr->mtl_shader_type_name);
@@ -507,7 +655,12 @@ void mglShaderSource(GLMContext ctx, GLuint shader, GLsizei count, const GLchar 
             {
                 strlcat(src, string[i], len+1);
             }
-            assert(strlen(src) == len);
+            if (strlen(src) != (size_t)len) {
+                fprintf(stderr,
+                        "MGL WARNING: shader source length mismatch expected=%zu actual=%zu\n",
+                        (size_t)len,
+                        strlen(src));
+            }
         } else {
             // CRITICAL SECURITY FIX: Prevent buffer overflow in shader source concatenation
             // string[i] may not be null-terminated - we must validate bounds carefully
@@ -589,8 +742,15 @@ void mglCompileShader(GLMContext ctx, GLuint shader)
         ptr->log = NULL;
     }
 
-    /* Set glslang options to auto-assign locations for legacy shaders */
-    int options = GLSLANG_SHADER_VULKAN_RULES_RELAXED;
+    /* Use OpenGL semantics (not Vulkan rules) and auto-map bindings/locations
+     * so Minecraft GLSL 330 shaders without explicit layout(binding=...) work.
+     */
+    /* IMPORTANT: do not auto-map bindings per-shader here.
+     * Per-shader auto binding assignment can diverge between VS/FS and then fail
+     * at program link with "Layout binding qualifier must match".
+     * We resolve bindings/locations at program level via glslang_program_map_io().
+     */
+    int options = GLSLANG_SHADER_AUTO_MAP_LOCATIONS;
 
     /* Detect if this is a legacy GLSL shader that needs location auto-assignment */
     int shader_version = 330; /* Default */
@@ -599,10 +759,8 @@ void mglCompileShader(GLMContext ctx, GLuint shader)
         sscanf(version_str, "#version %d", &shader_version);
     }
 
-    /* For GLSL < 330, auto-assign locations since old shaders don't have layout() qualifiers */
     if (shader_version < 330) {
-        options |= GLSLANG_SHADER_AUTO_MAP_LOCATIONS;
-        fprintf(stderr, "[MGL] Enabling auto-map locations for legacy GLSL %d shader\n", shader_version);
+        fprintf(stderr, "[MGL] Enabling compatibility mode for legacy GLSL %d shader\n", shader_version);
     }
     glslang_shader_set_options(glsl_shader, options);
 
@@ -731,7 +889,7 @@ void mglGetShaderiv(GLMContext ctx, GLuint shader, GLenum pname, GLint *params)
             break;
 
         case GL_INFO_LOG_LENGTH:
-            *params = (GLint)strlen(ptr->log);
+            *params = ptr->log ? (GLint)strlen(ptr->log) : 0;
             break;
 
         case GL_SHADER_SOURCE_LENGTH:
@@ -786,7 +944,7 @@ void mglGetShaderSource(GLMContext ctx, GLuint shader, GLsizei bufSize, GLsizei 
 
         if (source)
         {
-            if (bufSize >= strlen(ptr->log))
+            if (bufSize >= (GLsizei)ptr->src_len)
             {
                 memcpy(source, ptr->src, ptr->src_len);
             }
