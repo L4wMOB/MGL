@@ -2,7 +2,7 @@ set -e
 SDKPATH=`xcrun --sdk iphoneos --show-sdk-path`
 WORKINGDIR="build"
 CMAKE_BUILD_TYPE="release"
-JOBS=6
+JOBS=`sysctl -n hw.ncpu`
 
 cd SPIRV-Tools
 mkdir -p $WORKINGDIR
@@ -13,7 +13,8 @@ cd $WORKINGDIR && cmake . \
     -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
     -DCMAKE_OSX_SYSROOT=$SDKPATH \
     -DCMAKE_OSX_ARCHITECTURES=arm64 \
-    -DCMAKE_C_FLAGS="-arch arm64" \
+    -DCMAKE_C_FLAGS="-arch arm64 -target arm64-apple-ios14.0" \
+    -DCMAKE_CXX_FLAGS="-arch arm64 -target arm64-apple-ios14.0 -stdlib=libc++" \
     -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
     ..
 
@@ -28,7 +29,8 @@ cd $WORKINGDIR && cmake . \
     -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
     -DCMAKE_OSX_SYSROOT=$SDKPATH \
     -DCMAKE_OSX_ARCHITECTURES=arm64 \
-    -DCMAKE_C_FLAGS="-arch arm64" \
+    -DCMAKE_C_FLAGS="-arch arm64 -target arm64-apple-ios14.0" \
+    -DCMAKE_CXX_FLAGS="-arch arm64 -target arm64-apple-ios14.0 -stdlib=libc++" \
     -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
     ..
 
@@ -44,7 +46,8 @@ cd $WORKINGDIR && cmake . \
     -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
     -DCMAKE_OSX_SYSROOT=$SDKPATH \
     -DCMAKE_OSX_ARCHITECTURES=arm64 \
-    -DCMAKE_C_FLAGS="-arch arm64" \
+    -DCMAKE_C_FLAGS="-arch arm64 -target arm64-apple-ios14.0" \
+    -DCMAKE_CXX_FLAGS="-arch arm64 -target arm64-apple-ios14.0 -stdlib=libc++" \
     -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
     ..
 
@@ -60,7 +63,8 @@ cd $WORKINGDIR && cmake . \
     -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
     -DCMAKE_OSX_SYSROOT=$SDKPATH \
     -DCMAKE_OSX_ARCHITECTURES=arm64 \
-    -DCMAKE_C_FLAGS="-arch arm64" \
+    -DCMAKE_C_FLAGS="-arch arm64 -target arm64-apple-ios14.0" \
+    -DCMAKE_CXX_FLAGS="-arch arm64 -target arm64-apple-ios14.0 -stdlib=libc++" \
     -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
     ..
 
