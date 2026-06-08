@@ -192,8 +192,15 @@ void mglDrawBuffer(GLMContext ctx, GLenum buf)
         } else {
             FBOAttachment *att = &fbo->color_attachments[buf - GL_COLOR_ATTACHMENT0];
             // The attachment may be a texture (buf.tex) or an RBO (buf.rbo).
-            // Only flag an error if neither is set.
-            bool has_tex = (att->textarget != GL_RENDERBUFFER) && (att->buf.tex != NULL);
+            // buf.tex is a lazy-cached pointer: perform the same lookup that
+            // mglFramebufferAttachmentTextureObject() does so we don't reject a
+            // legitimately-attached texture whose Texture* hasn't been resolved yet.
+            if (!att->buf.tex && att->texture != 0u &&
+                att->textarget != GL_RENDERBUFFER) {
+                att->buf.tex = findTexture(ctx, att->texture);
+            }
+            bool has_tex = (att->textarget != GL_RENDERBUFFER) &&
+                           (att->buf.tex != NULL || att->texture != 0u);
             bool has_rbo = (att->textarget == GL_RENDERBUFFER) && (att->buf.rbo != NULL);
             if (!has_tex && !has_rbo) {
                 fprintf(stderr, "MGL Error: mglDrawBuffer: missing color attachment %u\n",
