@@ -194,16 +194,140 @@ void initGLSLInput(GLMContext ctx, GLuint type, const char *src, glslang_input_t
 
     input->default_version = glsl_version;
     input->default_profile = GLSLANG_CORE_PROFILE;
-    //input->messages = 0xFFFF & ~GLSLANG_MSG_RELAXED_ERRORS_BIT;
     input->messages = GLSLANG_MSG_DEFAULT_BIT | GLSLANG_MSG_DEBUG_INFO_BIT | GLSLANG_MSG_RELAXED_ERRORS_BIT;
     input->resource = glslang_default_resource();
-
-    // Do NOT force the version/profile — when set to 1 glslang overrides the
-    // shader's own #version directive and may silently switch to a non-core
-    // profile that rejects layout(binding=X) on UBOs (the "binding" error seen
-    // in the crash log).  Let glslang honour the #version already in the source
-    // (or the default_version above if no #version is present).
     input->force_default_version_and_profile = 0;
+
+    /* -----------------------------------------------------------------------
+     * AUTO-INJECT layout(binding=N) for uniform/buffer blocks that lack it.
+     *
+     * glslang targeting SPIR-V requires every UBO/SSBO to have an explicit
+     * binding= qualifier.  Minecraft 1.21 shaders use layout(std140) without
+     * binding=, which is valid GLSL 3.30 but illegal in SPIR-V mode.
+     *
+     * Strategy: scan the (already version-patched) source for occurrences of
+     *   layout(...) uniform <Name> {
+     *   layout(...) buffer  <Name> {
+     * where the layout qualifier does NOT already contain "binding".  For each
+     * such block found, rewrite "layout(std140)" → "layout(std140, binding=N)"
+     * incrementing N.  We allocate a fresh buffer large enough to hold the
+     * expanded text.
+     * ----------------------------------------------------------------------- */
+    {
+        const char *in_src = input->code;  // may point to modified_src or src
+        size_t in_len = strlen(in_src);
+
+        /* Upper-bound: each "layout(" → "layout(binding=99, " adds ~14 chars,
+         * and there are at most a handful of UBOs per shader.  Add 2KB slack. */
+        size_t out_max = in_len + 2048;
+        char *out = (char *)malloc(out_max);
+        if (!out) {
+            /* OOM — leave source unchanged */
+            goto done_inject;
+        }
+
+        char *dst = out;
+        const char *p   = in_src;
+        int binding_idx = 0;
+        bool modified   = false;
+
+        while (*p) {
+            /* Look for "layout" */
+            const char *layout_pos = strstr(p, "layout");
+            if (!layout_pos) {
+                /* Copy remainder verbatim */
+                size_t tail = strlen(p);
+                memcpy(dst, p, tail);
+                dst += tail;
+                p += tail;
+                break;
+            }
+
+            /* Copy everything up to "layout" */
+            size_t prefix = layout_pos - p;
+            memcpy(dst, p, prefix);
+            dst += prefix;
+            p = layout_pos;
+
+            /* Scan the layout(...) qualifier */
+            const char *open = strchr(p, '(');
+            if (!open) {
+                /* malformed — copy char and move on */
+                *dst++ = *p++;
+                continue;
+            }
+            const char *close = strchr(open, ')');
+            if (!close) {
+                *dst++ = *p++;
+                continue;
+            }
+
+            /* Grab qualifier text between ( and ) */
+            size_t qual_len = close - open - 1;  /* excluding parens */
+            char qual[256] = {0};
+            if (qual_len < sizeof(qual))
+                memcpy(qual, open + 1, qual_len);
+            else {
+                /* Too long — copy verbatim */
+                size_t chunk = close - p + 1;
+                memcpy(dst, p, chunk);
+                dst += chunk;
+                p = close + 1;
+                continue;
+            }
+
+            /* Check whether what follows is "uniform <name> {" or "buffer <name> {" */
+            const char *after_close = close + 1;
+            while (*after_close == ' ' || *after_close == '\t') after_close++;
+
+            bool is_block = (strncmp(after_close, "uniform", 7) == 0 ||
+                             strncmp(after_close, "buffer",  6) == 0);
+
+            /* Check if "binding" already present in qualifier */
+            bool has_binding = (strstr(qual, "binding") != NULL);
+
+            if (is_block && !has_binding) {
+                /* Inject binding=N into the qualifier */
+                char new_qual[320];
+                if (qual_len > 0)
+                    snprintf(new_qual, sizeof(new_qual), "layout(%s, binding=%d)", qual, binding_idx);
+                else
+                    snprintf(new_qual, sizeof(new_qual), "layout(binding=%d)", binding_idx);
+                binding_idx++;
+                size_t nql = strlen(new_qual);
+                memcpy(dst, new_qual, nql);
+                dst += nql;
+                p = close + 1;  /* skip past original "layout(...)" */
+                modified = true;
+            } else {
+                /* Copy original layout(...) verbatim */
+                size_t chunk = close - p + 1;
+                memcpy(dst, p, chunk);
+                dst += chunk;
+                p = close + 1;
+            }
+        }
+
+        *dst = '\0';
+
+        if (modified) {
+            /* Replace input->code with the patched version.
+             * We reuse the modified_src static buffer if it is large enough,
+             * otherwise keep the malloc'd buffer and point input->code at it.
+             * NOTE: we intentionally keep the malloc alive for the duration of
+             * the glslang_shader_preprocess call; glslang only reads input->code
+             * during that call so freeing afterwards is safe.  We store the
+             * pointer in a second static to free on next call. */
+            static char *inject_buf = NULL;
+            free(inject_buf);
+            inject_buf = out;  /* transfer ownership */
+            input->code = inject_buf;
+            fprintf(stderr, "[MGL] Auto-injected binding qualifiers into %d UBO/SSBO block(s)\n", binding_idx);
+        } else {
+            free(out);
+        }
+        done_inject:;
+    }
 }
 
 Shader *newShader(GLMContext ctx, GLenum type, GLuint shader)
