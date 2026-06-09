@@ -35,6 +35,8 @@
 #include "pixel_utils.h"
 #include "glm_context.h"
 
+extern Texture *findTexture(GLMContext ctx, GLuint texture);
+
 void mglClear(GLMContext ctx, GLbitfield mask)
 {
     if (mask & ~(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT))
